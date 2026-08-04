@@ -40,6 +40,7 @@ const (
 	MapNameULCL = "ULCL"
 	MapNameIpol = "IPOL"
 	MapNameFw4  = "FW4"
+	MapNameDNS  = "DNS"
 )
 
 // error codes
@@ -227,6 +228,7 @@ const (
 	DpFwFwd
 	DpFwRdr
 	DpFwTrap
+	DpFwDns
 )
 
 // FwDpWorkQ - work queue entry for fw related operation
@@ -249,6 +251,15 @@ type FwDpWorkQ struct {
 	FwVal2   uint32
 	FwRecord bool
 	OnDflt   bool
+}
+
+// DnsDpWorkQ - work queue entry for dns related operation
+type DnsDpWorkQ struct {
+	Work    DpWorkT
+	Status  *DpStatusT
+	Domain  string
+	ActType ruleTActType
+	Mark    uint32
 }
 
 // NatT - type of NAT
@@ -493,6 +504,7 @@ type DpHookInterface interface {
 	DpGetLock()
 	DpRelLock()
 	DpEbpfUnInit()
+	DpDnsPolicyMod(string, ruleTActType, uint32, DpWorkT) int
 }
 
 // DpPeer - Remote DP Peer information
@@ -835,6 +847,21 @@ func (dp *DpH) DpWorkOnPeerOp(pWq *PeerDpWorkQ) DpRetT {
 	return DpWqUnkErr
 }
 
+// DpWorkOnDns - routine to work on a dns policy work queue request
+func (dp *DpH) DpWorkOnDns(dWq *DnsDpWorkQ) DpRetT {
+	ret := dp.DpHooks.DpDnsPolicyMod(dWq.Domain, dWq.ActType, dWq.Mark, dWq.Work)
+	if dWq.Status != nil {
+		if ret == 0 {
+			*dWq.Status = 0
+		} else if dWq.Work == DpRemove {
+			*dWq.Status = DpRemoveErr
+		} else {
+			*dWq.Status = DpCreateErr
+		}
+	}
+	return DpRetT(ret)
+}
+
 // DpWorkSingle - routine to work on a single dp work queue request
 // DpSyncBarrier - token sent on ToDpCh to wait for all preceding work to complete
 type DpSyncBarrier struct {
@@ -883,6 +910,8 @@ func DpWorkSingle(dp *DpH, m interface{}) DpRetT {
 		ret = dp.DpWorkOnPeerOp(mq)
 	case *SockVIPDpWorkQ:
 		ret = dp.DpWorkOnSockVIP(mq)
+	case *DnsDpWorkQ:
+		ret = dp.DpWorkOnDns(mq)
 	default:
 		tk.LogIt(tk.LogError, "unexpected type %T\n", mq)
 		ret = DpWqUnkErr

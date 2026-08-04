@@ -1597,6 +1597,121 @@ func init() {
         }
       }
     },
+    "/config/dnspolicy": {
+      "post": {
+        "description": "Create an allow, drop, or trap policy for a domain suffix.",
+        "summary": "Create a DNS policy",
+        "parameters": [
+          {
+            "name": "attr",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/DNSPolicyEntry"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Malformed arguments for API call",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "409": {
+            "description": "DNS policy already exists",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "500": {
+            "description": "Internal service error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        }
+      },
+      "delete": {
+        "description": "Delete the policy for a normalized domain suffix.",
+        "summary": "Delete a DNS policy",
+        "parameters": [
+          {
+            "type": "string",
+            "description": "Domain suffix to remove",
+            "name": "domain",
+            "in": "query",
+            "required": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Malformed arguments for API call",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "404": {
+            "description": "DNS policy not found",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "500": {
+            "description": "Internal service error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        }
+      }
+    },
+    "/config/dnspolicy/all": {
+      "get": {
+        "description": "Get all domain suffix policies and their traffic counters.",
+        "summary": "Get all DNS policies",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "dnsPolicyAttr": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/DNSPolicyEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid authentication credentials",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "500": {
+            "description": "Internal service error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "503": {
+            "description": "Maintenance mode",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        }
+      }
+    },
     "/config/endpoint": {
       "post": {
         "description": "Adds a LB endpoint for monitoring",
@@ -6190,6 +6305,33 @@ func init() {
         }
       }
     },
+    "DNSPolicyEntry": {
+      "type": "object",
+      "required": [
+        "domain",
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "description": "Action applied to matching DNS queries",
+          "type": "string",
+          "enum": [
+            "allow",
+            "drop",
+            "trap"
+          ]
+        },
+        "counter": {
+          "description": "Traffic counters formatted as packets:bytes",
+          "type": "string",
+          "readOnly": true
+        },
+        "domain": {
+          "description": "Domain suffix; matching is case-insensitive and includes subdomains",
+          "type": "string"
+        }
+      }
+    },
     "DeviceInfoEntry": {
       "type": "object",
       "properties": {
@@ -9637,6 +9779,121 @@ func init() {
           },
           "409": {
             "description": "Resource Conflict. BFD session already exists",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "500": {
+            "description": "Internal service error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "503": {
+            "description": "Maintenance mode",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        }
+      }
+    },
+    "/config/dnspolicy": {
+      "post": {
+        "description": "Create an allow, drop, or trap policy for a domain suffix.",
+        "summary": "Create a DNS policy",
+        "parameters": [
+          {
+            "name": "attr",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/DNSPolicyEntry"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Malformed arguments for API call",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "409": {
+            "description": "DNS policy already exists",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "500": {
+            "description": "Internal service error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        }
+      },
+      "delete": {
+        "description": "Delete the policy for a normalized domain suffix.",
+        "summary": "Delete a DNS policy",
+        "parameters": [
+          {
+            "type": "string",
+            "description": "Domain suffix to remove",
+            "name": "domain",
+            "in": "query",
+            "required": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "OK"
+          },
+          "400": {
+            "description": "Malformed arguments for API call",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "404": {
+            "description": "DNS policy not found",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "500": {
+            "description": "Internal service error",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        }
+      }
+    },
+    "/config/dnspolicy/all": {
+      "get": {
+        "description": "Get all domain suffix policies and their traffic counters.",
+        "summary": "Get all DNS policies",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "dnsPolicyAttr": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/DNSPolicyEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid authentication credentials",
             "schema": {
               "$ref": "#/definitions/Error"
             }
@@ -14701,6 +14958,33 @@ func init() {
             "description": "cors list",
             "type": "string"
           }
+        }
+      }
+    },
+    "DNSPolicyEntry": {
+      "type": "object",
+      "required": [
+        "domain",
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "description": "Action applied to matching DNS queries",
+          "type": "string",
+          "enum": [
+            "allow",
+            "drop",
+            "trap"
+          ]
+        },
+        "counter": {
+          "description": "Traffic counters formatted as packets:bytes",
+          "type": "string",
+          "readOnly": true
+        },
+        "domain": {
+          "description": "Domain suffix; matching is case-insensitive and includes subdomains",
+          "type": "string"
         }
       }
     },

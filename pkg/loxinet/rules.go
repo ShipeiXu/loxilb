@@ -74,6 +74,7 @@ const (
 	RmInL4Src
 	RmInL4Dst
 	RmInL4Port
+	RmDomain
 	RmMax
 )
 
@@ -97,6 +98,8 @@ const (
 	NatFwMark                  = 0x80000000 // NAT Marker
 	SrcChkFwMark               = 0x40000000 // Src check Marker
 	OnDfltSnatFwMark           = 0x20000000 // Ondefault Snat Marker
+	DnsFwMark                  = 0x10000000 // Internal DNS parser marker
+	DnsParserFwPref            = 65535      // Reserved DNS parser rule priority
 	MaxSrcLBMarkerNum          = 28         // Max LB indexes which support source checks
 )
 
@@ -167,6 +170,7 @@ type ruleTuples struct {
 	inL4Dst  rule16RTuple
 	pref     uint32
 	path     string
+	domain   string
 }
 
 type ruleTActType uint
@@ -181,6 +185,7 @@ const (
 	RtActSnat
 	RtActFullNat
 	RtActFullProxy
+	RtActDns
 )
 
 // possible types of end-point probe
@@ -325,6 +330,7 @@ type ruleTableType uint
 const (
 	RtFw ruleTableType = iota + 1
 	RtLB
+	RtDns
 	RtMax
 )
 
@@ -332,6 +338,7 @@ const (
 const (
 	RtMaximumFw4s = (8 * 1024)
 	RtMaximumLbs  = (2 * 1024)
+	RtMaximumDns  = (4 * 1024) - 1 // Stats index zero is unused
 )
 
 // RuleCfg - tunable parameters related to inactive rules
@@ -394,10 +401,15 @@ func RulesInit(zone *Zone) *RuleH {
 	nRh.tables[RtFw].eMap = make(map[string]*ruleEnt)
 	nRh.tables[RtFw].Mark = utils.NewMarker(1, RtMaximumFw4s)
 
+	nRh.tables[RtLB].eMap = make(map[string]*ruleEnt)
 	nRh.tables[RtLB].tableMatch = RmL3Dst | RmL4Dst | RmL4Prot
 	nRh.tables[RtLB].tableType = RtEm
-	nRh.tables[RtLB].eMap = make(map[string]*ruleEnt)
 	nRh.tables[RtLB].Mark = utils.NewMarker(1, RtMaximumLbs)
+
+	nRh.tables[RtDns].tableMatch = RmDomain
+	nRh.tables[RtDns].tableType = RtEm
+	nRh.tables[RtDns].eMap = make(map[string]*ruleEnt)
+	nRh.tables[RtDns].Mark = utils.NewMarker(1, RtMaximumDns)
 
 	for i := 0; i < MaxEndPointCheckers; i++ {
 		nRh.epCs[i].tD = make(chan bool)
@@ -518,6 +530,9 @@ func (r *ruleTuples) ruleKey() string {
 		}
 	}
 	ks += fmt.Sprintf("%d", r.pref)
+	if r.domain != "" {
+		ks += r.domain
+	}
 	return ks
 }
 
@@ -656,6 +671,8 @@ func (a *ruleAct) String() string {
 		ks += fmt.Sprintf("%s", "allow")
 	} else if a.actType == RtActTrap {
 		ks += fmt.Sprintf("%s", "trap")
+	} else if a.actType == RtActDns {
+		ks += fmt.Sprintf("%s", "dns-parse")
 	} else if a.actType == RtActDnat ||
 		a.actType == RtActSnat ||
 		a.actType == RtActFullNat ||
@@ -2076,6 +2093,10 @@ func (R *RuleH) GetFwRule() ([]cmn.FwRuleMod, error) {
 	var res []cmn.FwRuleMod
 
 	for _, data := range R.tables[RtFw].eMap {
+		fwOpts := data.act.action.(*ruleFwOpts)
+		if fwOpts.op == RtActDns {
+			continue
+		}
 		var ret cmn.FwRuleMod
 		// Make Fw Arguments
 		ret.Rule.DstIP = data.tuples.l3Dst.addr.String()
@@ -2094,7 +2115,6 @@ func (R *RuleH) GetFwRule() ([]cmn.FwRuleMod, error) {
 		ret.Rule.Pref = data.tuples.pref
 
 		// Make Fw Opts
-		fwOpts := data.act.action.(*ruleFwOpts)
 		if fwOpts.op == RtActFwd {
 			ret.Opts.Allow = true
 		} else if fwOpts.op == RtActDrop {
@@ -2132,6 +2152,10 @@ func (R *RuleH) AddFwRule(fwRule cmn.FwRuleArg, fwOptArgs cmn.FwOptArg) (int, er
 	var l4src rule16RTuple
 	var l4dst rule16RTuple
 	var l4prot rule8Tuple
+
+	if fwRule.Pref == DnsParserFwPref && !fwOptArgs.DnsParse {
+		return RuleArgsErr, errors.New("firewall priority reserved for dns parser")
+	}
 
 	// Validate rule args
 	if fwOptArgs.DoSnat {
@@ -2193,12 +2217,16 @@ func (R *RuleH) AddFwRule(fwRule cmn.FwRuleArg, fwOptArgs cmn.FwOptArg) (int, er
 	r.zone = R.zone
 
 	/* Default is drop */
+	r.act.actType = RtActDrop
 	fwOpts.op = RtActDrop
 	fwOpts.opt.fwMark = fwOptArgs.Mark
 	fwOpts.opt.record = fwOptArgs.Record
 	fwOpts.opt.onDflt = fwOptArgs.OnDefault
 
-	if fwOptArgs.Allow {
+	if fwOptArgs.DnsParse {
+		r.act.actType = RtActDns
+		fwOpts.op = RtActDns
+	} else if fwOptArgs.Allow {
 		r.act.actType = RtActFwd
 		fwOpts.op = RtActFwd
 	} else if fwOptArgs.Drop {
@@ -2291,6 +2319,10 @@ func (R *RuleH) AddFwRule(fwRule cmn.FwRuleArg, fwOptArgs cmn.FwOptArg) (int, er
 // On success, it will return 0 and nil error, else appropriate return code and
 // error string will be set
 func (R *RuleH) DeleteFwRule(fwRule cmn.FwRuleArg) (int, error) {
+	return R.deleteFwRule(fwRule, false)
+}
+
+func (R *RuleH) deleteFwRule(fwRule cmn.FwRuleArg, internal bool) (int, error) {
 	var l4src rule16RTuple
 	var l4dst rule16RTuple
 	var l4prot rule8Tuple
@@ -2319,7 +2351,7 @@ func (R *RuleH) DeleteFwRule(fwRule cmn.FwRuleArg) (int, error) {
 		l4src = rule16RTuple{fwRule.SrcPortMin, fwRule.SrcPortMax, true}
 	}
 	if (fwRule.DstPortMax != 0 || fwRule.DstPortMin != 0) && fwRule.DstPortMax >= fwRule.DstPortMin {
-		l4src = rule16RTuple{fwRule.DstPortMin, fwRule.DstPortMax, true}
+		l4dst = rule16RTuple{fwRule.DstPortMin, fwRule.DstPortMax, true}
 	}
 	inport := ruleStringTuple{fwRule.InPort}
 	rt := ruleTuples{l3Src: l3src, l3Dst: l3dst, l4Prot: l4prot, l4Src: l4src, l4Dst: l4dst, port: inport, pref: fwRule.Pref}
@@ -2327,6 +2359,9 @@ func (R *RuleH) DeleteFwRule(fwRule cmn.FwRuleArg) (int, error) {
 	rule := R.tables[RtFw].eMap[rt.ruleKey()]
 	if rule == nil {
 		return RuleNotExistsErr, errors.New("no-rule error")
+	}
+	if rule.act.actType == RtActDns && !internal {
+		return RuleArgsErr, errors.New("internal dns parser firewall rule")
 	}
 
 	if rule.act.actType == RtActSnat {
@@ -2373,6 +2408,186 @@ func (R *RuleH) DeleteFwRule(fwRule cmn.FwRuleArg) (int, error) {
 	rule.Fw2DP(DpRemove)
 
 	return 0, nil
+}
+
+func normalizeDNSDomain(domain string) (string, error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	domain = strings.TrimSuffix(domain, ".")
+	if domain == "" || len(domain) > 253 {
+		return "", errors.New("invalid dns domain length")
+	}
+
+	labels := strings.Split(domain, ".")
+	if len(labels) > 32 {
+		return "", errors.New("dns domain has too many labels")
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return "", errors.New("invalid dns label length")
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return "", errors.New("dns label cannot start or end with a hyphen")
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_' {
+				return "", errors.New("dns domain must contain ascii labels; use punycode for idn")
+			}
+		}
+	}
+
+	return domain, nil
+}
+
+func encodeDNSDomain(domain string) string {
+	labels := strings.Split(domain, ".")
+	for i, j := 0, len(labels)-1; i < j; i, j = i+1, j-1 {
+		labels[i], labels[j] = labels[j], labels[i]
+	}
+	return strings.Join(labels, ".") + "."
+}
+
+func dnsPolicyAction(o cmn.FwOptArg) (ruleTActType, error) {
+	actions := 0
+	if o.Allow {
+		actions++
+	}
+	if o.Drop {
+		actions++
+	}
+	if o.Trap {
+		actions++
+	}
+	if actions != 1 {
+		return 0, errors.New("dns policy requires exactly one action")
+	}
+	if o.Allow {
+		return RtActFwd, nil
+	}
+	if o.Trap {
+		return RtActTrap, nil
+	}
+	return RtActDrop, nil
+}
+
+func dnsParserFwRules() []cmn.FwRuleArg {
+	return []cmn.FwRuleArg{
+		{SrcIP: "0.0.0.0/0", DstIP: "0.0.0.0/0", Proto: 17, DstPortMin: 53, DstPortMax: 53, Pref: DnsParserFwPref},
+		{SrcIP: "::/0", DstIP: "::/0", Proto: 17, DstPortMin: 53, DstPortMax: 53, Pref: DnsParserFwPref},
+	}
+}
+
+func (R *RuleH) enableDNSParser() error {
+	installed := make([]cmn.FwRuleArg, 0, 2)
+	opts := cmn.FwOptArg{DnsParse: true, Mark: DnsFwMark}
+	for _, rule := range dnsParserFwRules() {
+		if _, err := R.AddFwRule(rule, opts); err != nil {
+			for _, added := range installed {
+				_, _ = R.deleteFwRule(added, true)
+			}
+			return fmt.Errorf("install dns parser firewall rule: %w", err)
+		}
+		installed = append(installed, rule)
+	}
+	return nil
+}
+
+func (R *RuleH) disableDNSParser() error {
+	var firstErr error
+	for _, rule := range dnsParserFwRules() {
+		if _, err := R.deleteFwRule(rule, true); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// AddDnsPolicy - Add a DNS policy rule.
+func (R *RuleH) AddDnsPolicy(dm cmn.DnsPolicyArg, o cmn.FwOptArg) (int, error) {
+	domain, err := normalizeDNSDomain(dm.Domain)
+	if err != nil {
+		return RuleArgsErr, err
+	}
+	action, err := dnsPolicyAction(o)
+	if err != nil {
+		return RuleArgsErr, err
+	}
+
+	rt := ruleTuples{domain: domain}
+	if R.tables[RtDns].eMap[rt.ruleKey()] != nil {
+		return RuleExistsErr, errors.New("dns-policy-exists error")
+	}
+
+	parserInstalled := false
+	if len(R.tables[RtDns].eMap) == 0 {
+		if err := R.enableDNSParser(); err != nil {
+			return RuleArgsErr, err
+		}
+		parserInstalled = true
+	}
+
+	r := &ruleEnt{tuples: rt, zone: R.zone, sT: time.Now()}
+	fwOpts := &ruleFwOpts{op: action}
+	r.act = ruleAct{actType: action, action: fwOpts}
+	r.ruleNum, err = R.tables[RtDns].Mark.GetMarker()
+	if err != nil {
+		if parserInstalled {
+			_ = R.disableDNSParser()
+		}
+		return RuleAllocErr, errors.New("rule-mark error")
+	}
+
+	R.tables[RtDns].eMap[rt.ruleKey()] = r
+	r.Dns2DP(DpCreate)
+	tk.LogIt(tk.LogDebug, "dns-policy added - %d:%s-%s\n", r.ruleNum, domain, r.act.String())
+	return 0, nil
+}
+
+// DeleteDnsPolicy - Delete a DNS policy rule.
+func (R *RuleH) DeleteDnsPolicy(dm cmn.DnsPolicyArg) (int, error) {
+	domain, err := normalizeDNSDomain(dm.Domain)
+	if err != nil {
+		return RuleArgsErr, err
+	}
+	rt := ruleTuples{domain: domain}
+	rule := R.tables[RtDns].eMap[rt.ruleKey()]
+	if rule == nil {
+		return RuleNotExistsErr, errors.New("no-rule error")
+	}
+
+	delete(R.tables[RtDns].eMap, rt.ruleKey())
+	rule.Dns2DP(DpRemove)
+	R.tables[RtDns].Mark.ReleaseMarker(rule.ruleNum)
+	tk.LogIt(tk.LogDebug, "dns-policy deleted %s-%s\n", domain, rule.act.String())
+
+	if len(R.tables[RtDns].eMap) == 0 {
+		if err := R.disableDNSParser(); err != nil {
+			return RuleArgsErr, fmt.Errorf("remove dns parser firewall rule: %w", err)
+		}
+	}
+	return 0, nil
+}
+
+// GetDnsPolicy - Get all DNS policy rules.
+func (R *RuleH) GetDnsPolicy() ([]cmn.DnsPolicyMod, error) {
+	res := make([]cmn.DnsPolicyMod, 0, len(R.tables[RtDns].eMap))
+	for _, data := range R.tables[RtDns].eMap {
+		var ret cmn.DnsPolicyMod
+		ret.Rule.Domain = data.tuples.domain
+		fwOpts := data.act.action.(*ruleFwOpts)
+		if fwOpts.op == RtActFwd {
+			ret.Opts.Allow = true
+		} else if fwOpts.op == RtActDrop {
+			ret.Opts.Drop = true
+		} else if fwOpts.op == RtActTrap {
+			ret.Opts.Trap = true
+		}
+		data.Dns2DP(DpStatsGetImm)
+		ret.Opts.Counter = fmt.Sprintf("%v:%v", data.stat.packets, data.stat.bytes)
+		res = append(res, ret)
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i].Rule.Domain < res[j].Rule.Domain })
+	return res, nil
 }
 
 // GetEpHosts - get all end-points and pack them into a cmn.EndPointMod slice
@@ -3243,6 +3458,8 @@ func (r *ruleEnt) Fw2DP(work DpWorkT) int {
 			nWork.FwVal1 = uint16(port.PortNo)
 		case RtActTrap:
 			nWork.FwType = DpFwTrap
+		case RtActDns:
+			nWork.FwType = DpFwDns
 		case RtActSnat:
 			nWork.FwType = DpFwFwd
 		default:
@@ -3260,6 +3477,35 @@ func (r *ruleEnt) Fw2DP(work DpWorkT) int {
 
 	mh.dp.ToDpCh <- nWork
 
+	return 0
+}
+
+// Dns2DP - Sync state of dns-rule entity to data-path
+func (r *ruleEnt) Dns2DP(work DpWorkT) int {
+	if work == DpStatsGet || work == DpStatsGetImm {
+		nStat := &StatDpWorkQ{
+			Work:    work,
+			Mark:    uint32(r.ruleNum),
+			Name:    MapNameDNS,
+			Bytes:   &r.stat.bytes,
+			Packets: &r.stat.packets,
+		}
+		if work == DpStatsGetImm {
+			DpWorkSingle(mh.dp, nStat)
+		} else {
+			mh.dp.ToDpCh <- nStat
+		}
+		return 0
+	}
+
+	nWork := new(DnsDpWorkQ)
+	nWork.Work = work
+	nWork.Status = &r.sync
+	nWork.Domain = encodeDNSDomain(r.tuples.domain)
+	nWork.ActType = r.act.actType
+	nWork.Mark = uint32(r.ruleNum)
+
+	mh.dp.ToDpCh <- nWork
 	return 0
 }
 

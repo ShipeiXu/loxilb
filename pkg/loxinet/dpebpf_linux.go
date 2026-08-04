@@ -95,6 +95,7 @@ const (
 	EbpfErrSockVIPMod
 	EbpfErrSockVIPAdd
 	EbpfErrSockVIPDel
+	EbpfErrDnsMod
 	EbpfErrWqUnk
 )
 
@@ -1297,6 +1298,8 @@ func (e *DpEbpfH) DpStat(w *StatDpWorkQ) int {
 		polTbl = append(polTbl, int(C.LL_DP_POL_MAP))
 	case w.Name == MapNameFw4:
 		tbl = append(tbl, int(C.LL_DP_FW4_MAP))
+	case w.Name == MapNameDNS:
+		tbl = append(tbl, int(C.LL_DP_DNS_TRIE_MAP))
 	default:
 		return EbpfErrWqUnk
 	}
@@ -1986,6 +1989,8 @@ func (e *DpEbpfH) dpFwRuleMod4(w *FwDpWorkQ) int {
 			pRdr.oport = C.ushort(w.FwVal1)
 		} else if w.FwType == DpFwTrap {
 			fwe.fwa.ca.act_type = C.DP_SET_TOCP
+		} else if w.FwType == DpFwDns {
+			fwe.fwa.ca.act_type = C.DP_SET_DNS_PARSE
 		}
 		fwe.fwa.ca.mark = C.uint(w.FwVal2)
 		if w.FwRecord {
@@ -2085,6 +2090,8 @@ func (e *DpEbpfH) dpFwRuleMod6(w *FwDpWorkQ) int {
 			pRdr.oport = C.ushort(w.FwVal1)
 		} else if w.FwType == DpFwTrap {
 			fwe.fwa.ca.act_type = C.DP_SET_TOCP
+		} else if w.FwType == DpFwDns {
+			fwe.fwa.ca.act_type = C.DP_SET_DNS_PARSE
 		}
 		fwe.fwa.ca.mark = C.uint(w.FwVal2)
 		if w.FwRecord {
@@ -2614,4 +2621,50 @@ func SysctlInit() {
 
 func SysctlPostInit() {
 	utils.WriteFile("/proc/sys/net/ipv4/conf/llb0/rp_filter", "0")
+}
+
+// DpDnsPolicyMod - routine to work on a ebpf dns policy modification
+func (e *DpEbpfH) DpDnsPolicyMod(domain string, act ruleTActType, mark uint32, work DpWorkT) int {
+	var key C.struct_dp_dns_key
+	var value C.struct_dp_fw_tact
+	C.memset(unsafe.Pointer(&key), 0, C.sizeof_struct_dp_dns_key)
+	C.memset(unsafe.Pointer(&value), 0, C.sizeof_struct_dp_fw_tact)
+
+	if len(domain) > 255 {
+		return EbpfErrDnsMod
+	}
+
+	key.l.prefixlen = C.uint(len(domain) * 8)
+	cDomain := C.CString(domain)
+	defer C.free(unsafe.Pointer(cDomain))
+	C.memcpy(unsafe.Pointer(&key.domain[0]), unsafe.Pointer(cDomain), C.size_t(len(domain)))
+
+	if work == DpCreate {
+		switch act {
+		case RtActDrop:
+			value.ca.act_type = C.DP_SET_DROP
+		case RtActFwd:
+			value.ca.act_type = C.DP_SET_NOP
+		case RtActTrap:
+			value.ca.act_type = C.DP_SET_TOCP
+		default:
+			return EbpfErrDnsMod
+		}
+		value.ca.cidx = C.uint(mark)
+		ret := C.llb_add_map_elem(C.LL_DP_DNS_TRIE_MAP,
+			unsafe.Pointer(&key),
+			unsafe.Pointer(&value))
+		if ret != 0 {
+			tk.LogIt(tk.LogError, "dns-policy add failed for %s\n", domain)
+			return EbpfErrDnsMod
+		}
+	} else if work == DpRemove {
+		if C.llb_del_map_elem(C.LL_DP_DNS_TRIE_MAP, unsafe.Pointer(&key)) != 0 {
+			return EbpfErrDnsMod
+		}
+	} else {
+		return EbpfErrWqUnk
+	}
+
+	return 0
 }

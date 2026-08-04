@@ -2373,7 +2373,7 @@ paths:
           description: Maintenance mode
           schema:
             $ref: '#/definitions/Error'
- 
+
     delete:
       summary: Delete of the firewall service
       description: Delete of the firewall service.
@@ -2444,6 +2444,86 @@ paths:
             $ref: '#/definitions/Error'
         '503':
           description: Maintenance mode
+          schema:
+            $ref: '#/definitions/Error'
+
+#----------------------------------------------
+# DNS Policy Configuration
+#----------------------------------------------
+  '/config/dnspolicy/all':
+    get:
+      summary: Get all DNS policies
+      description: Get all domain suffix policies and their traffic counters.
+      responses:
+        '200':
+          description: OK
+          schema:
+            type: object
+            properties:
+              dnsPolicyAttr:
+                type: array
+                items:
+                  $ref: '#/definitions/DNSPolicyEntry'
+        '401':
+          description: Invalid authentication credentials
+          schema:
+            $ref: '#/definitions/Error'
+        '500':
+          description: Internal service error
+          schema:
+            $ref: '#/definitions/Error'
+        '503':
+          description: Maintenance mode
+          schema:
+            $ref: '#/definitions/Error'
+
+  '/config/dnspolicy':
+    post:
+      summary: Create a DNS policy
+      description: Create an allow, drop, or trap policy for a domain suffix.
+      parameters:
+        - name: attr
+          in: body
+          required: true
+          schema:
+            $ref: '#/definitions/DNSPolicyEntry'
+      responses:
+        '204':
+          description: OK
+        '400':
+          description: Malformed arguments for API call
+          schema:
+            $ref: '#/definitions/Error'
+        '409':
+          description: DNS policy already exists
+          schema:
+            $ref: '#/definitions/Error'
+        '500':
+          description: Internal service error
+          schema:
+            $ref: '#/definitions/Error'
+    delete:
+      summary: Delete a DNS policy
+      description: Delete the policy for a normalized domain suffix.
+      parameters:
+        - name: domain
+          in: query
+          type: string
+          required: true
+          description: Domain suffix to remove
+      responses:
+        '204':
+          description: OK
+        '400':
+          description: Malformed arguments for API call
+          schema:
+            $ref: '#/definitions/Error'
+        '404':
+          description: DNS policy not found
+          schema:
+            $ref: '#/definitions/Error'
+        '500':
+          description: Internal service error
           schema:
             $ref: '#/definitions/Error'
 
@@ -4957,6 +5037,24 @@ definitions:
         $ref: '#/definitions/FirewallRuleEntry'
       opts:
         $ref: '#/definitions/FirewallOptionEntry'       
+
+  DNSPolicyEntry:
+    type: object
+    required:
+      - domain
+      - action
+    properties:
+      domain:
+        type: string
+        description: Domain suffix; matching is case-insensitive and includes subdomains
+      action:
+        type: string
+        enum: [allow, drop, trap]
+        description: Action applied to matching DNS queries
+      counter:
+        type: string
+        readOnly: true
+        description: Traffic counters formatted as packets:bytes
 
   OperParams:
     type: object

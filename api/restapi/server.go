@@ -3,7 +3,6 @@
 package restapi
 
 import (
-	"github.com/loxilb-io/loxilb/options"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -26,6 +25,7 @@ import (
 	"golang.org/x/net/netutil"
 
 	"github.com/loxilb-io/loxilb/api/restapi/operations"
+	"github.com/loxilb-io/loxilb/options"
 )
 
 const (

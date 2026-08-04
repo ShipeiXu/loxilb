@@ -434,6 +434,8 @@ type FwOptArg struct {
 	OnDefault bool `json:"onDefault"`
 	// Counter - Traffic counter
 	Counter string `json:"counter"`
+	// DnsParse - Internal option used to install the DNS policy parser rule
+	DnsParse bool `json:"-"`
 }
 
 // FwRuleArg - Information related to firewall rule
@@ -1120,6 +1122,9 @@ type NetHookInterface interface {
 	NetFwRuleAdd(*FwRuleMod) (int, error)
 	NetFwRuleDel(*FwRuleMod) (int, error)
 	NetFwRuleGet() ([]FwRuleMod, error)
+	NetDnsPolicyAdd(*DnsPolicyMod) (int, error)
+	NetDnsPolicyDel(*DnsPolicyMod) (int, error)
+	NetDnsPolicyGet() ([]DnsPolicyMod, error)
 	NetEpHostAdd(fm *EndPointMod) (int, error)
 	NetEpHostDel(fm *EndPointMod) (int, error)
 	NetEpHostGet() ([]EndPointMod, error)
@@ -1162,4 +1167,18 @@ type NetHookInterface interface {
 
 	NetPrometheusEnable() error
 	NetHandlePanic()
+}
+
+// DnsPolicyArg - Information related to DNS policy rule
+type DnsPolicyArg struct {
+	// Domain - Domain name to filter
+	Domain string `json:"domain"`
+}
+
+// DnsPolicyMod - Info related to a DNS policy entry
+type DnsPolicyMod struct {
+	// Rule - service argument of type DnsPolicyArg
+	Rule DnsPolicyArg `json:"ruleArguments"`
+	// Opts - firewall options
+	Opts FwOptArg `json:"opts"`
 }

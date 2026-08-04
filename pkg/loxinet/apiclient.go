@@ -869,3 +869,36 @@ func (na *NetAPIStruct) NetPrometheusEnable() error {
 	mh.PrometheusInit()
 	return nil
 }
+
+// NetDnsPolicyAdd - Add a DNS policy in loxilb
+func (na *NetAPIStruct) NetDnsPolicyAdd(dm *cmn.DnsPolicyMod) (int, error) {
+	if na.BgpPeerMode {
+		return RuleArgsErr, errors.New("running in bgp only mode")
+	}
+	mh.mtx.Lock()
+	defer mh.mtx.Unlock()
+
+	ret, err := mh.zr.Rules.AddDnsPolicy(dm.Rule, dm.Opts)
+	return ret, err
+}
+
+// NetDnsPolicyDel - Delete a DNS policy in loxilb
+func (na *NetAPIStruct) NetDnsPolicyDel(dm *cmn.DnsPolicyMod) (int, error) {
+	if na.BgpPeerMode {
+		return RuleArgsErr, errors.New("running in bgp only mode")
+	}
+	mh.mtx.Lock()
+	defer mh.mtx.Unlock()
+
+	ret, err := mh.zr.Rules.DeleteDnsPolicy(dm.Rule)
+	return ret, err
+}
+
+// NetDnsPolicyGet - Get DNS policies in loxilb
+func (na *NetAPIStruct) NetDnsPolicyGet() ([]cmn.DnsPolicyMod, error) {
+	if na.BgpPeerMode {
+		return nil, errors.New("running in bgp only mode")
+	}
+	ret, err := mh.zr.Rules.GetDnsPolicy()
+	return ret, err
+}

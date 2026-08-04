@@ -68,6 +68,9 @@ func NewLoxilbRestAPIAPI(spec *loads.Document) *LoxilbRestAPIAPI {
 		DeleteConfigCorsCorsURLHandler: DeleteConfigCorsCorsURLHandlerFunc(func(params DeleteConfigCorsCorsURLParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation DeleteConfigCorsCorsURL has not yet been implemented")
 		}),
+		DeleteConfigDnspolicyHandler: DeleteConfigDnspolicyHandlerFunc(func(params DeleteConfigDnspolicyParams, principal interface{}) middleware.Responder {
+			return middleware.NotImplemented("operation DeleteConfigDnspolicy has not yet been implemented")
+		}),
 		DeleteConfigEndpointEpipaddressIPAddressHandler: DeleteConfigEndpointEpipaddressIPAddressHandlerFunc(func(params DeleteConfigEndpointEpipaddressIPAddressParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation DeleteConfigEndpointEpipaddressIPAddress has not yet been implemented")
 		}),
@@ -154,6 +157,9 @@ func NewLoxilbRestAPIAPI(spec *loads.Document) *LoxilbRestAPIAPI {
 		}),
 		GetConfigCorsAllHandler: GetConfigCorsAllHandlerFunc(func(params GetConfigCorsAllParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation GetConfigCorsAll has not yet been implemented")
+		}),
+		GetConfigDnspolicyAllHandler: GetConfigDnspolicyAllHandlerFunc(func(params GetConfigDnspolicyAllParams, principal interface{}) middleware.Responder {
+			return middleware.NotImplemented("operation GetConfigDnspolicyAll has not yet been implemented")
 		}),
 		GetConfigEndpointAllHandler: GetConfigEndpointAllHandlerFunc(func(params GetConfigEndpointAllParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation GetConfigEndpointAll has not yet been implemented")
@@ -317,6 +323,9 @@ func NewLoxilbRestAPIAPI(spec *loads.Document) *LoxilbRestAPIAPI {
 		PostConfigCorsHandler: PostConfigCorsHandlerFunc(func(params PostConfigCorsParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation PostConfigCors has not yet been implemented")
 		}),
+		PostConfigDnspolicyHandler: PostConfigDnspolicyHandlerFunc(func(params PostConfigDnspolicyParams, principal interface{}) middleware.Responder {
+			return middleware.NotImplemented("operation PostConfigDnspolicy has not yet been implemented")
+		}),
 		PostConfigEndpointHandler: PostConfigEndpointHandlerFunc(func(params PostConfigEndpointParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation PostConfigEndpoint has not yet been implemented")
 		}),
@@ -447,6 +456,8 @@ type LoxilbRestAPIAPI struct {
 	DeleteConfigBgpPolicyDefinitionsPolicyNameHandler DeleteConfigBgpPolicyDefinitionsPolicyNameHandler
 	// DeleteConfigCorsCorsURLHandler sets the operation handler for the delete config cors cors URL operation
 	DeleteConfigCorsCorsURLHandler DeleteConfigCorsCorsURLHandler
+	// DeleteConfigDnspolicyHandler sets the operation handler for the delete config dnspolicy operation
+	DeleteConfigDnspolicyHandler DeleteConfigDnspolicyHandler
 	// DeleteConfigEndpointEpipaddressIPAddressHandler sets the operation handler for the delete config endpoint epipaddress IP address operation
 	DeleteConfigEndpointEpipaddressIPAddressHandler DeleteConfigEndpointEpipaddressIPAddressHandler
 	// DeleteConfigFdbMacAddressDevIfNameHandler sets the operation handler for the delete config fdb mac address dev if name operation
@@ -505,6 +516,8 @@ type LoxilbRestAPIAPI struct {
 	GetConfigConntrackAllHandler GetConfigConntrackAllHandler
 	// GetConfigCorsAllHandler sets the operation handler for the get config cors all operation
 	GetConfigCorsAllHandler GetConfigCorsAllHandler
+	// GetConfigDnspolicyAllHandler sets the operation handler for the get config dnspolicy all operation
+	GetConfigDnspolicyAllHandler GetConfigDnspolicyAllHandler
 	// GetConfigEndpointAllHandler sets the operation handler for the get config endpoint all operation
 	GetConfigEndpointAllHandler GetConfigEndpointAllHandler
 	// GetConfigExportHandler sets the operation handler for the get config export operation
@@ -613,6 +626,8 @@ type LoxilbRestAPIAPI struct {
 	PostConfigCistateHandler PostConfigCistateHandler
 	// PostConfigCorsHandler sets the operation handler for the post config cors operation
 	PostConfigCorsHandler PostConfigCorsHandler
+	// PostConfigDnspolicyHandler sets the operation handler for the post config dnspolicy operation
+	PostConfigDnspolicyHandler PostConfigDnspolicyHandler
 	// PostConfigEndpointHandler sets the operation handler for the post config endpoint operation
 	PostConfigEndpointHandler PostConfigEndpointHandler
 	// PostConfigEndpointhoststateHandler sets the operation handler for the post config endpointhoststate operation
@@ -760,6 +775,9 @@ func (o *LoxilbRestAPIAPI) Validate() error {
 	if o.DeleteConfigCorsCorsURLHandler == nil {
 		unregistered = append(unregistered, "DeleteConfigCorsCorsURLHandler")
 	}
+	if o.DeleteConfigDnspolicyHandler == nil {
+		unregistered = append(unregistered, "DeleteConfigDnspolicyHandler")
+	}
 	if o.DeleteConfigEndpointEpipaddressIPAddressHandler == nil {
 		unregistered = append(unregistered, "DeleteConfigEndpointEpipaddressIPAddressHandler")
 	}
@@ -846,6 +864,9 @@ func (o *LoxilbRestAPIAPI) Validate() error {
 	}
 	if o.GetConfigCorsAllHandler == nil {
 		unregistered = append(unregistered, "GetConfigCorsAllHandler")
+	}
+	if o.GetConfigDnspolicyAllHandler == nil {
+		unregistered = append(unregistered, "GetConfigDnspolicyAllHandler")
 	}
 	if o.GetConfigEndpointAllHandler == nil {
 		unregistered = append(unregistered, "GetConfigEndpointAllHandler")
@@ -1008,6 +1029,9 @@ func (o *LoxilbRestAPIAPI) Validate() error {
 	}
 	if o.PostConfigCorsHandler == nil {
 		unregistered = append(unregistered, "PostConfigCorsHandler")
+	}
+	if o.PostConfigDnspolicyHandler == nil {
+		unregistered = append(unregistered, "PostConfigDnspolicyHandler")
 	}
 	if o.PostConfigEndpointHandler == nil {
 		unregistered = append(unregistered, "PostConfigEndpointHandler")
@@ -1202,6 +1226,10 @@ func (o *LoxilbRestAPIAPI) initHandlerCache() {
 	if o.handlers["DELETE"] == nil {
 		o.handlers["DELETE"] = make(map[string]http.Handler)
 	}
+	o.handlers["DELETE"]["/config/dnspolicy"] = NewDeleteConfigDnspolicy(o.context, o.DeleteConfigDnspolicyHandler)
+	if o.handlers["DELETE"] == nil {
+		o.handlers["DELETE"] = make(map[string]http.Handler)
+	}
 	o.handlers["DELETE"]["/config/endpoint/epipaddress/{ip_address}"] = NewDeleteConfigEndpointEpipaddressIPAddress(o.context, o.DeleteConfigEndpointEpipaddressIPAddressHandler)
 	if o.handlers["DELETE"] == nil {
 		o.handlers["DELETE"] = make(map[string]http.Handler)
@@ -1315,6 +1343,10 @@ func (o *LoxilbRestAPIAPI) initHandlerCache() {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
 	o.handlers["GET"]["/config/cors/all"] = NewGetConfigCorsAll(o.context, o.GetConfigCorsAllHandler)
+	if o.handlers["GET"] == nil {
+		o.handlers["GET"] = make(map[string]http.Handler)
+	}
+	o.handlers["GET"]["/config/dnspolicy/all"] = NewGetConfigDnspolicyAll(o.context, o.GetConfigDnspolicyAllHandler)
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
@@ -1531,6 +1563,10 @@ func (o *LoxilbRestAPIAPI) initHandlerCache() {
 		o.handlers["POST"] = make(map[string]http.Handler)
 	}
 	o.handlers["POST"]["/config/cors"] = NewPostConfigCors(o.context, o.PostConfigCorsHandler)
+	if o.handlers["POST"] == nil {
+		o.handlers["POST"] = make(map[string]http.Handler)
+	}
+	o.handlers["POST"]["/config/dnspolicy"] = NewPostConfigDnspolicy(o.context, o.PostConfigDnspolicyHandler)
 	if o.handlers["POST"] == nil {
 		o.handlers["POST"] = make(map[string]http.Handler)
 	}

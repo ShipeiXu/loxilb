@@ -157,6 +157,11 @@ func configureAPI(api *operations.LoxilbRestAPIAPI) http.Handler {
 	api.PostConfigFirewallHandler = operations.PostConfigFirewallHandlerFunc(handler.ConfigPostFW)
 	api.DeleteConfigFirewallHandler = operations.DeleteConfigFirewallHandlerFunc(handler.ConfigDeleteFW)
 
+	// DNS Policy
+	api.GetConfigDnspolicyAllHandler = operations.GetConfigDnspolicyAllHandlerFunc(handler.ConfigGetDNSPolicy)
+	api.PostConfigDnspolicyHandler = operations.PostConfigDnspolicyHandlerFunc(handler.ConfigPostDNSPolicy)
+	api.DeleteConfigDnspolicyHandler = operations.DeleteConfigDnspolicyHandlerFunc(handler.ConfigDeleteDNSPolicy)
+
 	// EndPoint
 	api.GetConfigEndpointAllHandler = operations.GetConfigEndpointAllHandlerFunc(handler.ConfigGetEndPoint)
 	api.PostConfigEndpointHandler = operations.PostConfigEndpointHandlerFunc(handler.ConfigPostEndPoint)
