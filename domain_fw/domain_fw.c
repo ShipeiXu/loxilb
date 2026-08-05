@@ -65,7 +65,8 @@
 #define DOMAINFW_BLOOM_BITS           (1UL << 20)
 #define DOMAINFW_BLOOM_HASHES         3U
 
-/* Values are local to retain compatibility with older IPv6 UAPI headers. */
+/* Values are local to retain compatibility with older kernel UAPI headers. */
+#define DOMAINFW_IP4_FRAGMENT_MASK    0x3fffU
 #define DOMAINFW_IP6_HOP              0U
 #define DOMAINFW_IP6_ROUTING          43U
 #define DOMAINFW_IP6_FRAGMENT         44U
@@ -1121,7 +1122,7 @@ static bool domainfw_ipv4_payload(const struct sk_buff *skb,
 
 	iph = skb_header_pointer(skb, network_offset, sizeof(ipbuf), &ipbuf);
 	if (!iph || iph->version != 4 || iph->ihl < 5 ||
-	    (ntohs(iph->frag_off) & (IP_MF | IP_OFFSET)))
+	    (ntohs(iph->frag_off) & DOMAINFW_IP4_FRAGMENT_MASK))
 		return false;
 	ip_header_len = iph->ihl * 4;
 	ip_total_len = ntohs(iph->tot_len);
