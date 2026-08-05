@@ -23,6 +23,7 @@
 #define DOMAINFW_HAVE_IPV6 0
 #endif
 #include <linux/jhash.h>
+#include <linux/jump_label.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -36,6 +37,7 @@
 #include <linux/seq_file.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
+#include <linux/smp.h>
 #include <linux/string.h>
 #include <linux/tcp.h>
 #include <linux/types.h>
@@ -47,6 +49,7 @@
 #define DOMAINFW_PROC_DIR             "domain_fw"
 #define DOMAINFW_CONTROL_FILE         "control"
 #define DOMAINFW_STATS_FILE           "stats"
+#define DOMAINFW_RULE_STATS_FILE      "rule_stats"
 
 #define DOMAINFW_TRIE_BUCKETS         16384U
 #define DOMAINFW_MAX_NAME             253U
@@ -72,12 +75,29 @@
 #define DOMAINFW_IP6_DEST             60U
 #define DOMAINFW_IP6_FRAGMENT_MASK    0xfff9U
 
+/*
+ * A counter belongs to one explicit (zone, QTYPE) rule.  The refcount is
+ * held by every immutable QTYPE set that references it, so an unchanged
+ * rule keeps its counter when another QTYPE is added or removed from a zone.
+ */
+struct domainfw_rule_counter {
+	atomic_t refs;
+	bool provisional;
+	u64 __percpu *hits;
+};
+
+struct domainfw_qtype_rule {
+	u16 qtype;
+	struct domainfw_rule_counter __rcu *counter;
+};
+
 /* A sorted arbitrary-QTYPE set belonging to one zone trie node. */
 struct domainfw_qtype_set {
 	struct rcu_head rcu;
 	u16 count;
 	bool all;
-	u16 types[0];
+	struct domainfw_rule_counter __rcu *all_counter;
+	struct domainfw_qtype_rule rules[0];
 };
 
 struct domainfw_trie_node {
@@ -121,6 +141,7 @@ static struct proc_dir_entry *domainfw_proc_dir;
 static struct proc_dir_entry *domainfw_proc_control;
 static struct proc_dir_entry *domainfw_proc_stats;
 static struct proc_dir_entry *domainfw_proc_rules;
+static struct proc_dir_entry *domainfw_proc_rule_stats;
 
 static bool enabled = true;
 module_param(enabled, bool, 0644);
@@ -141,6 +162,10 @@ MODULE_PARM_DESC(tcp_dns, "Inspect DNS-over-TCP frames (default: 1)");
 static bool bloom_enabled;
 module_param(bloom_enabled, bool, 0644);
 MODULE_PARM_DESC(bloom_enabled, "Use Bloom filter as a trie negative cache (default: 0)");
+
+static bool domainfw_rule_stats;
+static bool domainfw_ready;
+static DEFINE_STATIC_KEY_FALSE(domainfw_rule_stats_key);
 
 static int hook_priority = NF_IP_PRI_FIRST;
 module_param(hook_priority, int, 0444);
@@ -168,12 +193,68 @@ static u32 domainfw_node_hash(const struct domainfw_trie_node *parent,
 	       (DOMAINFW_TRIE_BUCKETS - 1);
 }
 
+static struct domainfw_rule_counter *
+domainfw_rule_counter_alloc(bool provisional)
+{
+	struct domainfw_rule_counter *counter;
+	unsigned int cpu;
+
+	counter = kzalloc(sizeof(*counter), GFP_KERNEL);
+	if (!counter)
+		return NULL;
+	counter->hits = alloc_percpu(u64);
+	if (!counter->hits) {
+		kfree(counter);
+		return NULL;
+	}
+	for_each_possible_cpu(cpu)
+		*per_cpu_ptr(counter->hits, cpu) = 0;
+	atomic_set(&counter->refs, 1);
+	counter->provisional = provisional;
+	return counter;
+}
+
+static void domainfw_rule_counter_get(struct domainfw_rule_counter *counter)
+{
+	if (counter)
+		atomic_inc(&counter->refs);
+}
+
+static void domainfw_rule_counter_put(struct domainfw_rule_counter *counter)
+{
+	if (counter && atomic_dec_and_test(&counter->refs)) {
+		free_percpu(counter->hits);
+		kfree(counter);
+	}
+}
+
+static void domainfw_rule_counter_hit(struct domainfw_rule_counter *counter)
+{
+	this_cpu_inc(*counter->hits);
+}
+
+static void domainfw_qtype_set_release(struct domainfw_qtype_set *set)
+{
+	struct domainfw_rule_counter *counter;
+	u16 i;
+
+	if (!set)
+		return;
+	counter = rcu_access_pointer(set->all_counter);
+	domainfw_rule_counter_put(counter);
+	for (i = 0; i < set->count; i++) {
+		counter = rcu_access_pointer(set->rules[i].counter);
+		domainfw_rule_counter_put(counter);
+	}
+	kfree(set);
+}
+
 static void domainfw_qtype_set_free_rcu(struct rcu_head *rcu)
 {
 	struct domainfw_qtype_set *set;
 
 	set = container_of(rcu, struct domainfw_qtype_set, rcu);
-	kfree(set);
+	domainfw_qtype_set_release(set);
 }
 
 static void domainfw_node_free_rcu(struct rcu_head *rcu)
@@ -183,36 +264,63 @@ static void domainfw_node_free_rcu(struct rcu_head *rcu)
 
 	node = container_of(rcu, struct domainfw_trie_node, rcu);
 	set = rcu_access_pointer(node->qtypes);
-	kfree(set);
+	domainfw_qtype_set_release(set);
 	kfree(node);
 }
 
-static bool domainfw_qtype_has_specific(const struct domainfw_qtype_set *set,
-					 u16 qtype)
+static const struct domainfw_qtype_rule *
+domainfw_qtype_find_specific(const struct domainfw_qtype_set *set, u16 qtype)
 {
 	u16 left = 0;
 	u16 right;
 	u16 middle;
 
 	if (!set || qtype == DOMAINFW_QTYPE_ALL)
-		return false;
+		return NULL;
 	right = set->count;
 	while (left < right) {
 		middle = left + (right - left) / 2;
-		if (set->types[middle] == qtype)
-			return true;
-		if (set->types[middle] < qtype)
+		if (set->rules[middle].qtype == qtype)
+			return &set->rules[middle];
+		if (set->rules[middle].qtype < qtype)
 			left = middle + 1;
 		else
 			right = middle;
 	}
-	return false;
+	return NULL;
 }
 
-static bool domainfw_qtype_matches(const struct domainfw_qtype_set *set,
-				   u16 qtype)
+static bool domainfw_qtype_has_specific(const struct domainfw_qtype_set *set,
+					 u16 qtype)
+{
+	return domainfw_qtype_find_specific(set, qtype) != NULL;
+}
+
+static inline bool
+domainfw_qtype_matches_fast(const struct domainfw_qtype_set *set, u16 qtype)
 {
 	return set && (set->all || domainfw_qtype_has_specific(set, qtype));
+}
+
+static bool
+domainfw_qtype_matches_fast_with_counter(
+	const struct domainfw_qtype_set *set, u16 qtype,
+	struct domainfw_rule_counter **counter)
+{
+	const struct domainfw_qtype_rule *rule;
+
+	if (!set)
+		return false;
+	if (set->all) {
+		*counter = rcu_dereference(set->all_counter);
+		return true;
+	}
+	rule = domainfw_qtype_find_specific(set, qtype);
+	if (rule) {
+		*counter = rcu_dereference(rule->counter);
+		return true;
+	}
+	return false;
 }
 
 static struct domainfw_trie_node *
@@ -337,12 +445,45 @@ domainfw_qtype_set_alloc(u16 count, bool all)
 {
 	struct domainfw_qtype_set *set;
 
-	set = kzalloc(sizeof(*set) + count * sizeof(set->types[0]), GFP_KERNEL);
+	set = kzalloc(sizeof(*set) + count * sizeof(set->rules[0]), GFP_KERNEL);
 	if (!set)
 		return NULL;
 	set->count = count;
 	set->all = all;
 	return set;
+}
+
+static void domainfw_qtype_copy_counter(struct domainfw_rule_counter __rcu **dst,
+					struct domainfw_rule_counter *counter)
+{
+	domainfw_rule_counter_get(counter);
+	RCU_INIT_POINTER(*dst, counter);
+}
+
+static int domainfw_qtype_new_counter(struct domainfw_rule_counter __rcu **slot)
+{
+	struct domainfw_rule_counter *counter;
+
+	if (!READ_ONCE(domainfw_rule_stats)) {
+		RCU_INIT_POINTER(*slot, NULL);
+		return 0;
+	}
+	counter = domainfw_rule_counter_alloc(false);
+	if (!counter)
+		return -ENOMEM;
+	RCU_INIT_POINTER(*slot, counter);
+	return 0;
+}
+
+static void domainfw_qtype_copy_rule(struct domainfw_qtype_rule *dst,
+				    const struct domainfw_qtype_rule *src)
+{
+	struct domainfw_rule_counter *counter;
+
+	dst->qtype = src->qtype;
+	counter = rcu_dereference_protected(src->counter,
+		lockdep_is_held(&domainfw_config_lock));
+	domainfw_qtype_copy_counter(&dst->counter, counter);
 }
 
 /* Build a replacement set; NULL is a valid empty replacement. */
@@ -352,10 +493,12 @@ static int domainfw_qtype_set_update(const struct domainfw_qtype_set *old,
 {
 	struct domainfw_qtype_set *new_set;
 	bool exists;
+	bool new_all;
 	u16 new_count;
 	u16 src = 0;
 	u16 dst = 0;
 	bool inserted = false;
+	int ret;
 
 	exists = qtype == DOMAINFW_QTYPE_ALL ? old && old->all :
 		 domainfw_qtype_has_specific(old, qtype);
@@ -371,39 +514,68 @@ static int domainfw_qtype_set_update(const struct domainfw_qtype_set *old,
 		else
 			new_count--;
 	}
-	if (!(qtype == DOMAINFW_QTYPE_ALL ? add : old && old->all) &&
-	    !new_count) {
+	new_all = qtype == DOMAINFW_QTYPE_ALL ? add : old && old->all;
+	if (!new_all && !new_count) {
 		*replacement = NULL;
 		return 0;
 	}
 
-	new_set = domainfw_qtype_set_alloc(new_count,
-		qtype == DOMAINFW_QTYPE_ALL ? add : old && old->all);
+	new_set = domainfw_qtype_set_alloc(new_count, new_all);
 	if (!new_set)
 		return -ENOMEM;
+	if (new_all) {
+		if (old && old->all) {
+			struct domainfw_rule_counter *counter;
+
+			counter = rcu_dereference_protected(old->all_counter,
+				lockdep_is_held(&domainfw_config_lock));
+			domainfw_qtype_copy_counter(&new_set->all_counter, counter);
+		}
+		else {
+			ret = domainfw_qtype_new_counter(&new_set->all_counter);
+			if (ret)
+				goto err_release;
+		}
+	}
 
 	if (qtype == DOMAINFW_QTYPE_ALL) {
-		if (old && old->count)
-			memcpy(new_set->types, old->types,
-			       old->count * sizeof(old->types[0]));
+		for (src = 0; old && src < old->count; src++)
+			domainfw_qtype_copy_rule(&new_set->rules[dst++],
+						  &old->rules[src]);
 	} else if (add) {
 		for (src = 0; old && src < old->count; src++) {
-			if (!inserted && qtype < old->types[src]) {
-				new_set->types[dst++] = qtype;
+			if (!inserted && qtype < old->rules[src].qtype) {
+				new_set->rules[dst].qtype = qtype;
+				ret = domainfw_qtype_new_counter(
+					&new_set->rules[dst].counter);
+				if (ret)
+					goto err_release;
+				dst++;
 				inserted = true;
 			}
-			new_set->types[dst++] = old->types[src];
+			domainfw_qtype_copy_rule(&new_set->rules[dst++],
+						  &old->rules[src]);
 		}
-		if (!inserted)
-			new_set->types[dst++] = qtype;
+		if (!inserted) {
+			new_set->rules[dst].qtype = qtype;
+			ret = domainfw_qtype_new_counter(&new_set->rules[dst].counter);
+			if (ret)
+				goto err_release;
+			dst++;
+		}
 	} else {
 		for (src = 0; src < old->count; src++)
-			if (old->types[src] != qtype)
-				new_set->types[dst++] = old->types[src];
+			if (old->rules[src].qtype != qtype)
+				domainfw_qtype_copy_rule(&new_set->rules[dst++],
+							  &old->rules[src]);
 	}
 
 	*replacement = new_set;
 	return 0;
+
+err_release:
+	domainfw_qtype_set_release(new_set);
+	return ret;
 }
 
 static int domainfw_set_qtype_locked(struct domainfw_trie_node *node,
@@ -423,6 +595,158 @@ static int domainfw_set_qtype_locked(struct domainfw_trie_node *node,
 		call_rcu(&old->rcu, domainfw_qtype_set_free_rcu);
 	return 0;
 }
+
+static int domainfw_qtype_set_enable_stats_locked(struct domainfw_qtype_set *set)
+{
+	struct domainfw_rule_counter *counter;
+	u16 i;
+
+	if (!set)
+		return 0;
+	if (set->all && !rcu_access_pointer(set->all_counter)) {
+		counter = domainfw_rule_counter_alloc(true);
+		if (!counter)
+			return -ENOMEM;
+		rcu_assign_pointer(set->all_counter, counter);
+	}
+	for (i = 0; i < set->count; i++) {
+		if (rcu_access_pointer(set->rules[i].counter))
+			continue;
+		counter = domainfw_rule_counter_alloc(true);
+		if (!counter)
+			return -ENOMEM;
+		rcu_assign_pointer(set->rules[i].counter, counter);
+	}
+	return 0;
+}
+
+static void
+domainfw_qtype_set_finish_stats_locked(struct domainfw_qtype_set *set,
+				       bool commit)
+{
+	struct domainfw_rule_counter *counter;
+	u16 i;
+
+	if (!set)
+		return;
+	counter = rcu_dereference_protected(set->all_counter,
+		lockdep_is_held(&domainfw_config_lock));
+	if (counter && counter->provisional) {
+		if (commit) {
+			counter->provisional = false;
+		} else {
+			rcu_assign_pointer(set->all_counter, NULL);
+			domainfw_rule_counter_put(counter);
+		}
+	}
+	for (i = 0; i < set->count; i++) {
+		counter = rcu_dereference_protected(set->rules[i].counter,
+			lockdep_is_held(&domainfw_config_lock));
+		if (!counter || !counter->provisional)
+			continue;
+		if (commit) {
+			counter->provisional = false;
+		} else {
+			rcu_assign_pointer(set->rules[i].counter, NULL);
+			domainfw_rule_counter_put(counter);
+		}
+	}
+}
+
+static void domainfw_finish_rule_stats_locked(bool commit)
+{
+	struct hlist_node *hnode;
+	struct domainfw_trie_node *node;
+	struct domainfw_qtype_set *set;
+	unsigned int i;
+
+	set = rcu_dereference_protected(domainfw_root.qtypes,
+		lockdep_is_held(&domainfw_config_lock));
+	domainfw_qtype_set_finish_stats_locked(set, commit);
+	for (i = 0; i < DOMAINFW_TRIE_BUCKETS; i++) {
+		for (hnode = domainfw_trie[i].first; hnode; hnode = hnode->next) {
+			node = hlist_entry(hnode, struct domainfw_trie_node, hnode);
+			set = rcu_dereference_protected(node->qtypes,
+				lockdep_is_held(&domainfw_config_lock));
+			domainfw_qtype_set_finish_stats_locked(set, commit);
+		}
+	}
+}
+
+/* Allocate all existing per-rule counters before enabling data-path writes. */
+static int domainfw_enable_rule_stats_locked(void)
+{
+	struct hlist_node *hnode;
+	struct domainfw_trie_node *node;
+	struct domainfw_qtype_set *set;
+	unsigned int i;
+	int ret;
+
+	set = rcu_dereference_protected(domainfw_root.qtypes,
+		lockdep_is_held(&domainfw_config_lock));
+	ret = domainfw_qtype_set_enable_stats_locked(set);
+	if (ret)
+		return ret;
+	for (i = 0; i < DOMAINFW_TRIE_BUCKETS; i++) {
+		for (hnode = domainfw_trie[i].first; hnode; hnode = hnode->next) {
+			node = hlist_entry(hnode, struct domainfw_trie_node, hnode);
+			set = rcu_dereference_protected(node->qtypes,
+				lockdep_is_held(&domainfw_config_lock));
+			ret = domainfw_qtype_set_enable_stats_locked(set);
+			if (ret)
+				return ret;
+		}
+	}
+	return 0;
+}
+
+static int domainfw_param_set_rule_stats(const char *value,
+					 const struct kernel_param *kp)
+{
+	bool requested;
+	int ret;
+
+	(void)kp;
+	ret = kstrtobool(value, &requested);
+	if (ret)
+		return ret;
+
+	mutex_lock(&domainfw_config_lock);
+	if (!READ_ONCE(domainfw_ready)) {
+		WRITE_ONCE(domainfw_rule_stats, requested);
+		mutex_unlock(&domainfw_config_lock);
+		return 0;
+	}
+	if (requested && !READ_ONCE(domainfw_rule_stats)) {
+		ret = domainfw_enable_rule_stats_locked();
+		if (ret) {
+			/* No new reader can enter the statistics path while disabled. */
+			synchronize_rcu();
+			domainfw_finish_rule_stats_locked(false);
+		} else {
+			domainfw_finish_rule_stats_locked(true);
+			smp_wmb();
+			static_branch_enable(&domainfw_rule_stats_key);
+			WRITE_ONCE(domainfw_rule_stats, true);
+		}
+	} else if (!requested && READ_ONCE(domainfw_rule_stats)) {
+		static_branch_disable(&domainfw_rule_stats_key);
+		WRITE_ONCE(domainfw_rule_stats, false);
+		ret = 0;
+	} else {
+		ret = 0;
+	}
+	mutex_unlock(&domainfw_config_lock);
+	return ret;
+}
+
+static const struct kernel_param_ops domainfw_rule_stats_ops = {
+	.set = domainfw_param_set_rule_stats,
+	.get = param_get_bool,
+};
+module_param_cb(rule_stats, &domainfw_rule_stats_ops, &domainfw_rule_stats, 0644);
+MODULE_PARM_DESC(rule_stats,
+	"Count effective (zone, QTYPE) drops with per-CPU counters (default: 0)");
 
 /* Remove now-empty leaves, retaining all shared prefixes. */
 static void domainfw_prune_empty_locked(struct domainfw_trie_node *node)
@@ -668,6 +992,49 @@ static void domainfw_flush_rules(void)
 		call_rcu(&root_set->rcu, domainfw_qtype_set_free_rcu);
 }
 
+static noinline bool domainfw_rule_matches_with_stats_rcu(const char *qname,
+					  u16 qname_len, u16 qtype)
+{
+	struct domainfw_trie_node *node;
+	struct domainfw_trie_node *parent = &domainfw_root;
+	struct domainfw_qtype_set *set;
+	struct domainfw_rule_counter *winner_counter = NULL;
+	const char *start;
+	const char *end = qname + qname_len;
+	u8 label_len;
+
+	set = rcu_dereference(domainfw_root.qtypes);
+	if (domainfw_qtype_matches_fast_with_counter(set, qtype,
+						    &winner_counter))
+		goto hit;
+	if (READ_ONCE(bloom_enabled) &&
+	    !domainfw_bloom_maybe_matches(qname, qname_len))
+		return false;
+
+	for (;;) {
+		start = end;
+		while (start > qname && start[-1] != '.')
+			start--;
+		label_len = (u8)(end - start);
+		node = domainfw_find_child_rcu(parent, start, label_len);
+		if (!node)
+			break;
+		set = rcu_dereference(node->qtypes);
+		if (domainfw_qtype_matches_fast_with_counter(set, qtype,
+						    &winner_counter))
+			goto hit;
+		parent = node;
+		if (start == qname)
+			break;
+		end = start - 1;
+	}
+	return false;
+hit:
+	if (winner_counter)
+		domainfw_rule_counter_hit(winner_counter);
+	return true;
+}
+
 static bool domainfw_rule_matches(const char *qname, u16 qname_len, u16 qtype)
 {
 	struct domainfw_trie_node *node;
@@ -679,8 +1046,15 @@ static bool domainfw_rule_matches(const char *qname, u16 qname_len, u16 qtype)
 	bool matched = false;
 
 	rcu_read_lock();
+	if (static_branch_unlikely(&domainfw_rule_stats_key)) {
+		smp_rmb();
+		matched = domainfw_rule_matches_with_stats_rcu(qname, qname_len,
+							      qtype);
+		goto out;
+	}
+
 	set = rcu_dereference(domainfw_root.qtypes);
-	if (domainfw_qtype_matches(set, qtype)) {
+	if (domainfw_qtype_matches_fast(set, qtype)) {
 		matched = true;
 		goto out;
 	}
@@ -697,9 +1071,9 @@ static bool domainfw_rule_matches(const char *qname, u16 qname_len, u16 qtype)
 		if (!node)
 			break;
 		set = rcu_dereference(node->qtypes);
-		if (domainfw_qtype_matches(set, qtype)) {
+		if (domainfw_qtype_matches_fast(set, qtype)) {
 			matched = true;
-			break;
+			goto out;
 		}
 		parent = node;
 		if (start == qname)
@@ -1096,6 +1470,7 @@ static int domainfw_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "enabled %u\n", enabled ? 1 : 0);
 	seq_printf(m, "tcp_dns %u\n", tcp_dns ? 1 : 0);
 	seq_printf(m, "bloom_enabled %u\n", bloom_enabled ? 1 : 0);
+	seq_printf(m, "rule_stats %u\n", READ_ONCE(domainfw_rule_stats) ? 1 : 0);
 	seq_printf(m, "dns_port %u\n", dns_port);
 	seq_printf(m, "rules %d\n", atomic_read(&domainfw_rule_count));
 	seq_printf(m, "queries %llu\n", (unsigned long long)queries);
@@ -1141,7 +1516,40 @@ static void domainfw_seq_show_rule_set(struct seq_file *m, const char *zone,
 	if (set->all)
 		seq_printf(m, "%s *\n", zone);
 	for (i = 0; i < set->count && !seq_has_overflowed(m); i++)
-		seq_printf(m, "%s TYPE%u\n", zone, set->types[i]);
+		seq_printf(m, "%s TYPE%u\n", zone, set->rules[i].qtype);
+}
+
+static u64 domainfw_rule_counter_total(struct domainfw_rule_counter *counter)
+{
+	u64 total = 0;
+	unsigned int cpu;
+
+	if (!counter)
+		return 0;
+	for_each_possible_cpu(cpu)
+		total += *per_cpu_ptr(counter->hits, cpu);
+	return total;
+}
+
+static void domainfw_seq_show_rule_stats_set(struct seq_file *m,
+					     const char *zone,
+					     const struct domainfw_qtype_set *set)
+{
+	struct domainfw_rule_counter *counter;
+	u16 i;
+
+	if (set->all) {
+		counter = rcu_dereference_protected(set->all_counter,
+			lockdep_is_held(&domainfw_config_lock));
+		seq_printf(m, "%s * %llu\n", zone,
+			(unsigned long long)domainfw_rule_counter_total(counter));
+	}
+	for (i = 0; i < set->count && !seq_has_overflowed(m); i++) {
+		counter = rcu_dereference_protected(set->rules[i].counter,
+			lockdep_is_held(&domainfw_config_lock));
+		seq_printf(m, "%s TYPE%u %llu\n", zone, set->rules[i].qtype,
+			(unsigned long long)domainfw_rule_counter_total(counter));
+	}
 }
 
 /*
@@ -1184,6 +1592,46 @@ static int domainfw_rules_open(struct inode *inode, struct file *file)
 	return single_open(file, domainfw_rules_show, NULL);
 }
 
+/*
+ * Unlike "rules", this file is observability-only: its third column is not
+ * accepted by the rule loader.  Keeping the configuration export unchanged
+ * preserves its load/replace round-trip behavior.
+ */
+static int domainfw_rule_stats_show(struct seq_file *m, void *v)
+{
+	struct hlist_node *hnode;
+	struct domainfw_trie_node *node;
+	struct domainfw_qtype_set *set;
+	char zone[DOMAINFW_MAX_NAME + 1];
+	unsigned int i;
+
+	mutex_lock(&domainfw_config_lock);
+	set = rcu_dereference_protected(domainfw_root.qtypes,
+		lockdep_is_held(&domainfw_config_lock));
+	if (set)
+		domainfw_seq_show_rule_stats_set(m, "*", set);
+
+	for (i = 0; i < DOMAINFW_TRIE_BUCKETS && !seq_has_overflowed(m); i++) {
+		for (hnode = domainfw_trie[i].first; hnode && !seq_has_overflowed(m);
+		     hnode = hnode->next) {
+			node = hlist_entry(hnode, struct domainfw_trie_node, hnode);
+			set = rcu_dereference_protected(node->qtypes,
+				lockdep_is_held(&domainfw_config_lock));
+			if (!set)
+				continue;
+			domainfw_format_zone(node, zone);
+			domainfw_seq_show_rule_stats_set(m, zone, set);
+		}
+	}
+	mutex_unlock(&domainfw_config_lock);
+	return 0;
+}
+
+static int domainfw_rule_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, domainfw_rule_stats_show, NULL);
+}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
 static const struct proc_ops domainfw_control_proc_ops = {
 	.proc_write = domainfw_control_write,
@@ -1197,6 +1645,12 @@ static const struct proc_ops domainfw_stats_proc_ops = {
 };
 static const struct proc_ops domainfw_rules_proc_ops = {
 	.proc_open = domainfw_rules_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+static const struct proc_ops domainfw_rule_stats_proc_ops = {
+	.proc_open = domainfw_rule_stats_open,
 	.proc_read = seq_read,
 	.proc_lseek = seq_lseek,
 	.proc_release = single_release,
@@ -1221,10 +1675,19 @@ static const struct file_operations domainfw_rules_proc_ops = {
 	.llseek = seq_lseek,
 	.release = single_release,
 };
+static const struct file_operations domainfw_rule_stats_proc_ops = {
+	.owner = THIS_MODULE,
+	.open = domainfw_rule_stats_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 #endif
 
 static void domainfw_remove_proc(void)
 {
+	if (domainfw_proc_rule_stats)
+		remove_proc_entry(DOMAINFW_RULE_STATS_FILE, domainfw_proc_dir);
 	if (domainfw_proc_rules)
 		remove_proc_entry("rules", domainfw_proc_dir);
 	if (domainfw_proc_stats)
@@ -1236,6 +1699,7 @@ static void domainfw_remove_proc(void)
 	domainfw_proc_stats = NULL;
 	domainfw_proc_control = NULL;
 	domainfw_proc_rules = NULL;
+	domainfw_proc_rule_stats = NULL;
 	domainfw_proc_dir = NULL;
 }
 
@@ -1283,19 +1747,35 @@ static int __init domainfw_init(void)
 		ret = -ENOMEM;
 		goto err_proc;
 	}
+	domainfw_proc_rule_stats = proc_create(DOMAINFW_RULE_STATS_FILE, 0400,
+						domainfw_proc_dir,
+						&domainfw_rule_stats_proc_ops);
+	if (!domainfw_proc_rule_stats) {
+		ret = -ENOMEM;
+		goto err_proc;
+	}
 
 	domainfw_nf_ops[0].priority = hook_priority;
 #if DOMAINFW_HAVE_IPV6
 	domainfw_nf_ops[1].priority = hook_priority;
 #endif
+	mutex_lock(&domainfw_config_lock);
+	if (READ_ONCE(domainfw_rule_stats))
+		static_branch_enable(&domainfw_rule_stats_key);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
 	ret = nf_register_net_hooks(&init_net, domainfw_nf_ops,
 				    ARRAY_SIZE(domainfw_nf_ops));
 #else
 	ret = nf_register_hooks(domainfw_nf_ops, ARRAY_SIZE(domainfw_nf_ops));
 #endif
-	if (ret)
+	if (ret) {
+		if (READ_ONCE(domainfw_rule_stats))
+			static_branch_disable(&domainfw_rule_stats_key);
+		mutex_unlock(&domainfw_config_lock);
 		goto err_proc;
+	}
+	WRITE_ONCE(domainfw_ready, true);
+	mutex_unlock(&domainfw_config_lock);
 	pr_info(DOMAINFW_NAME ": enabled at PRE_ROUTING priority %d\n",
 		hook_priority);
 	return 0;
@@ -1316,6 +1796,13 @@ static void __exit domainfw_exit(void)
 #else
 	nf_unregister_hooks(domainfw_nf_ops, ARRAY_SIZE(domainfw_nf_ops));
 #endif
+	mutex_lock(&domainfw_config_lock);
+	WRITE_ONCE(domainfw_ready, false);
+	if (READ_ONCE(domainfw_rule_stats)) {
+		static_branch_disable(&domainfw_rule_stats_key);
+		WRITE_ONCE(domainfw_rule_stats, false);
+	}
+	mutex_unlock(&domainfw_config_lock);
 	domainfw_remove_proc();
 	domainfw_flush_rules();
 	rcu_barrier();

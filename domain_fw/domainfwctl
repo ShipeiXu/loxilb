@@ -7,11 +7,12 @@ set -eu
 control=${DOMAINFW_CONTROL:-/proc/domain_fw/control}
 stats=${DOMAINFW_STATS:-/proc/domain_fw/stats}
 rules=${DOMAINFW_RULES:-/proc/domain_fw/rules}
+rule_stats=${DOMAINFW_RULE_STATS:-/proc/domain_fw/rule_stats}
 
 usage() {
     echo "Usage: $0 {add|del} ZONE [QTYPE]" >&2
     echo "       $0 {load|replace} FILE" >&2
-    echo "       $0 {flush|stats|rules}" >&2
+    echo "       $0 {flush|stats|rules|rule-stats}" >&2
     exit 2
 }
 
@@ -61,6 +62,10 @@ case ${1:-} in
     rules|list)
         [ $# -eq 1 ] || usage
         cat "$rules"
+        ;;
+    rule-stats|hits)
+        [ $# -eq 1 ] || usage
+        cat "$rule_stats"
         ;;
     load)
         [ $# -eq 2 ] || usage

@@ -43,6 +43,7 @@ sudo insmod domain_fw.ko
 /proc/domain_fw/control  # 仅 root 可写的命令接口
 /proc/domain_fw/stats    # 计数器和当前规则数量
 /proc/domain_fw/rules    # 当前配置的规则导出（只读）
+/proc/domain_fw/rule_stats # 每条当前规则的命中计数（只读）
 ```
 
 可用模块参数：
@@ -52,6 +53,7 @@ sudo insmod domain_fw.ko max_rules=262144
 sudo insmod domain_fw.ko dns_port=53
 sudo insmod domain_fw.ko tcp_dns=0  # 如不需要 TCP DNS，可关闭它
 sudo insmod domain_fw.ko bloom_enabled=1  # 按压测结果选择启用 Bloom Filter
+sudo insmod domain_fw.ko rule_stats=1  # 启用每条规则的按 CPU 命中计数
 echo 0 | sudo tee /sys/module/domain_fw/parameters/enabled
 ```
 
@@ -60,6 +62,7 @@ echo 0 | sudo tee /sys/module/domain_fw/parameters/enabled
 ```sh
 echo 0 | sudo tee /sys/module/domain_fw/parameters/tcp_dns
 echo 1 | sudo tee /sys/module/domain_fw/parameters/bloom_enabled
+echo 1 | sudo tee /sys/module/domain_fw/parameters/rule_stats
 ```
 
 默认优先级为 `NF_IP_PRI_FIRST`，早于 raw 表。为与已有 Netfilter 规则栈集成，
@@ -79,6 +82,11 @@ echo 1 | sudo tee /sys/module/domain_fw/parameters/bloom_enabled
 
 在同一 zone 同时配置 `ANY` 和特定 QTYPE 时，特定 QTYPE 会保留；删除 `ANY` 后，
 先前配置的特定 QTYPE 规则仍然有效。
+
+同一个查询可能被多个 zone 覆盖，例如同时存在 `* PTR`、`example.com ANY` 与
+`www.example.com PTR`。实际丢弃动作与统计归属都采用**首个命中即返回**的顺序：先检查
+`*`，再从顶级域逐级走向完整域名；同一个 zone 内 `ANY` 优先于特定 QTYPE。因而上述
+`www.example.com` 的 PTR 查询会记入 `(*, PTR)` 一次，不会继续查找更具体的规则。
 
 ```sh
 # 拦截 example.com 及其所有子域的所有查询。
@@ -118,11 +126,36 @@ sudo install -m 0755 domainfwctl /usr/local/sbin/domainfwctl
 sudo domainfwctl replace deny-zones.txt
 sudo domainfwctl stats
 sudo domainfwctl rules > running-rules.txt
+sudo domainfwctl rule-stats
 ```
 
 `rules` 输出格式为 `ZONE QTYPE`。QTYPE 使用无歧义的 `TYPE<n>` 格式，全部
 类型使用 `*`；输出顺序不保证按域名排序。该文件可通过 `domainfwctl replace`
 重新导入。
+
+## 每规则命中计数（可选）
+
+`rule_stats` 默认是 `0`，此时 static key 保持关闭，数据路径沿用首个匹配立即返回的
+快速路径。启用它时，模块会为每条当前显式 `(zone, QTYPE)` 规则分配按 CPU 分片的
+`u64` 计数器；统计路径沿用相同的首个命中即返回顺序，只对实际触发丢弃的那一条规则
+执行本 CPU 的加一操作，不会触发跨 CPU 的共享原子变量竞争。
+
+```sh
+# 运行时开启；若内存不足，写入会失败，本次新分配的计数器会回滚，且开关维持关闭。
+echo 1 | sudo tee /sys/module/domain_fw/parameters/rule_stats
+
+# 每行：ZONE QTYPE HITS。该文件仅供观察，不可直接作为规则文件导入。
+cat /proc/domain_fw/rule_stats
+sudo domainfwctl rule-stats
+
+# 关闭后不再累加；仍保留的规则会继续显示此前的累计值。
+echo 0 | sudo tee /sys/module/domain_fw/parameters/rule_stats
+```
+
+读取 `rule_stats` 时会汇总各 CPU 的分片，流量并发到达时它是一个近似快照。新增的
+规则在统计开启后从零开始；删除规则会同时移除其计数。内存开销约为
+`规则数 × 可能 CPU 数 × 8 字节`（另有少量元数据）；例如 1 万条规则、64 个 CPU
+约为 5 MiB。因此在只需要全局 `dropped` 计数时应保持默认关闭。
 
 `replace` 会先执行 `flush`，再执行 `load`，因此并不是原子化的策略切换。若
 策略更新必须原子生效，可在短暂的重载窗口内保留原有 iptables 规则，或者将控制
