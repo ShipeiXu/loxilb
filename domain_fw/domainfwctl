@@ -1,0 +1,77 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Small control-plane helper for domain_fw.  It needs only POSIX /bin/sh.
+
+set -eu
+
+control=${DOMAINFW_CONTROL:-/proc/domain_fw/control}
+stats=${DOMAINFW_STATS:-/proc/domain_fw/stats}
+rules=${DOMAINFW_RULES:-/proc/domain_fw/rules}
+
+usage() {
+    echo "Usage: $0 {add|del} ZONE [QTYPE]" >&2
+    echo "       $0 {load|replace} FILE" >&2
+    echo "       $0 {flush|stats|rules}" >&2
+    exit 2
+}
+
+write_rule() {
+    operation=$1
+    zone=$2
+    qtype=${3:-ANY}
+    printf '%s %s %s\n' "$operation" "$zone" "$qtype" > "$control"
+}
+
+load_rules() {
+    rule_file=$1
+
+    # One open file descriptor is substantially cheaper than opening procfs
+    # once per rule when loading tens of thousands of entries.
+    exec 3>"$control"
+    while IFS=' ' read -r zone qtype extra; do
+        case ${zone:-} in
+            ''|'#'*) continue ;;
+        esac
+        if [ -n "${extra:-}" ]; then
+            echo "invalid rule line: $zone $qtype $extra" >&2
+            exit 2
+        fi
+        printf 'add %s %s\n' "$zone" "${qtype:-ANY}" >&3
+    done < "$rule_file"
+    exec 3>&-
+}
+
+case ${1:-} in
+    add)
+        [ $# -ge 2 ] && [ $# -le 3 ] || usage
+        write_rule add "$2" "${3:-ANY}"
+        ;;
+    del|delete)
+        [ $# -ge 2 ] && [ $# -le 3 ] || usage
+        write_rule del "$2" "${3:-ANY}"
+        ;;
+    flush)
+        [ $# -eq 1 ] || usage
+        printf 'flush\n' > "$control"
+        ;;
+    stats)
+        [ $# -eq 1 ] || usage
+        cat "$stats"
+        ;;
+    rules|list)
+        [ $# -eq 1 ] || usage
+        cat "$rules"
+        ;;
+    load)
+        [ $# -eq 2 ] || usage
+        load_rules "$2"
+        ;;
+    replace)
+        [ $# -eq 2 ] || usage
+        printf 'flush\n' > "$control"
+        load_rules "$2"
+        ;;
+    *)
+        usage
+        ;;
+esac
