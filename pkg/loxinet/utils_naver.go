@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -104,7 +105,7 @@ func (n *NcloudClient) NcloudCreatePrivateIp(ni string, vIP net.IP) error {
 	}
 
 	if checkReturn.AssignSecondaryIpsResponse.ReturnMessage != "success" {
-		return fmt.Errorf(string(respBody))
+		return errors.New(string(respBody))
 	}
 
 	return nil
@@ -142,7 +143,7 @@ func (n *NcloudClient) NcloudDeletePrivateIp(ni string, vIP net.IP) error {
 	}
 
 	if checkReturn.UnassignSecondaryIpsResponse.ReturnMessage != "success" {
-		return fmt.Errorf(string(respBody))
+		return errors.New(string(respBody))
 	}
 
 	return nil
