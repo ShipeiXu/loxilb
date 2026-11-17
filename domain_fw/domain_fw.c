@@ -166,7 +166,43 @@ MODULE_PARM_DESC(bloom_enabled, "Use Bloom filter as a trie negative cache (defa
 
 static bool domainfw_rule_stats;
 static bool domainfw_ready;
+#ifdef DEFINE_STATIC_KEY_FALSE
 static DEFINE_STATIC_KEY_FALSE(domainfw_rule_stats_key);
+#else
+/* CentOS 7 provides the original, untyped static-key API. */
+static struct static_key domainfw_rule_stats_key = STATIC_KEY_INIT_FALSE;
+#endif
+
+static inline bool domainfw_rule_stats_active(void)
+{
+#ifdef DEFINE_STATIC_KEY_FALSE
+	return static_branch_unlikely(&domainfw_rule_stats_key);
+#else
+	return static_key_false(&domainfw_rule_stats_key);
+#endif
+}
+
+/*
+ * Callers hold domainfw_config_lock and only change the key on a state
+ * transition.  Keep the legacy reference-counted inc/dec calls balanced.
+ */
+static void domainfw_rule_stats_enable(void)
+{
+#ifdef DEFINE_STATIC_KEY_FALSE
+	static_branch_enable(&domainfw_rule_stats_key);
+#else
+	static_key_slow_inc(&domainfw_rule_stats_key);
+#endif
+}
+
+static void domainfw_rule_stats_disable(void)
+{
+#ifdef DEFINE_STATIC_KEY_FALSE
+	static_branch_disable(&domainfw_rule_stats_key);
+#else
+	static_key_slow_dec(&domainfw_rule_stats_key);
+#endif
+}
 
 static int hook_priority = NF_IP_PRI_FIRST;
 module_param(hook_priority, int, 0444);
@@ -727,11 +763,11 @@ static int domainfw_param_set_rule_stats(const char *value,
 		} else {
 			domainfw_finish_rule_stats_locked(true);
 			smp_wmb();
-			static_branch_enable(&domainfw_rule_stats_key);
+			domainfw_rule_stats_enable();
 			WRITE_ONCE(domainfw_rule_stats, true);
 		}
 	} else if (!requested && READ_ONCE(domainfw_rule_stats)) {
-		static_branch_disable(&domainfw_rule_stats_key);
+		domainfw_rule_stats_disable();
 		WRITE_ONCE(domainfw_rule_stats, false);
 		ret = 0;
 	} else {
@@ -1047,7 +1083,7 @@ static bool domainfw_rule_matches(const char *qname, u16 qname_len, u16 qtype)
 	bool matched = false;
 
 	rcu_read_lock();
-	if (static_branch_unlikely(&domainfw_rule_stats_key)) {
+	if (domainfw_rule_stats_active()) {
 		smp_rmb();
 		matched = domainfw_rule_matches_with_stats_rcu(qname, qname_len,
 							      qtype);
@@ -1371,14 +1407,23 @@ static unsigned int domainfw_inspect(struct sk_buff *skb, int family)
 	return domainfw_dns_verdict(skb, dns_offset, dns_len);
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 static unsigned int domainfw_nf_hook(void *priv, struct sk_buff *skb,
 				     const struct nf_hook_state *state)
 {
 	return domainfw_inspect(skb, state->pf);
 }
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
 static unsigned int domainfw_nf_hook(const struct nf_hook_ops *ops,
+				     struct sk_buff *skb,
+				     const struct nf_hook_state *state)
+{
+	return domainfw_inspect(skb, state->pf);
+}
+#else
+struct nf_hook_state;
+
+static unsigned int domainfw_nf_hook_legacy(const struct nf_hook_ops *ops,
 				     struct sk_buff *skb,
 				     const struct net_device *in,
 				     const struct net_device *out,
@@ -1386,6 +1431,26 @@ static unsigned int domainfw_nf_hook(const struct nf_hook_ops *ops,
 {
 	return domainfw_inspect(skb, ops->pf);
 }
+
+static unsigned int domainfw_nf_hook_state(const struct nf_hook_ops *ops,
+				    struct sk_buff *skb,
+				    const struct net_device *in,
+				    const struct net_device *out,
+				    const struct nf_hook_state *state)
+{
+	return domainfw_inspect(skb, ops->pf);
+}
+
+/*
+ * CentOS 7 backports nf_hook_state as the fifth argument while retaining
+ * its 3.10 version number.  Select the actual header ABI at compile time;
+ * a cast would hide a mismatched callback signature.
+ */
+#define domainfw_nf_hook \
+	__builtin_choose_expr( \
+		__builtin_types_compatible_p(nf_hookfn *, \
+					    typeof(&domainfw_nf_hook_state)), \
+		domainfw_nf_hook_state, domainfw_nf_hook_legacy)
 #endif
 
 static struct nf_hook_ops domainfw_nf_ops[] = {
@@ -1762,7 +1827,7 @@ static int __init domainfw_init(void)
 #endif
 	mutex_lock(&domainfw_config_lock);
 	if (READ_ONCE(domainfw_rule_stats))
-		static_branch_enable(&domainfw_rule_stats_key);
+		domainfw_rule_stats_enable();
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
 	ret = nf_register_net_hooks(&init_net, domainfw_nf_ops,
 				    ARRAY_SIZE(domainfw_nf_ops));
@@ -1771,7 +1836,7 @@ static int __init domainfw_init(void)
 #endif
 	if (ret) {
 		if (READ_ONCE(domainfw_rule_stats))
-			static_branch_disable(&domainfw_rule_stats_key);
+			domainfw_rule_stats_disable();
 		mutex_unlock(&domainfw_config_lock);
 		goto err_proc;
 	}
@@ -1800,7 +1865,7 @@ static void __exit domainfw_exit(void)
 	mutex_lock(&domainfw_config_lock);
 	WRITE_ONCE(domainfw_ready, false);
 	if (READ_ONCE(domainfw_rule_stats)) {
-		static_branch_disable(&domainfw_rule_stats_key);
+		domainfw_rule_stats_disable();
 		WRITE_ONCE(domainfw_rule_stats, false);
 	}
 	mutex_unlock(&domainfw_config_lock);

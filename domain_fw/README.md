@@ -4,8 +4,11 @@
 `NF_INET_PRE_ROUTING` 钩子处丢弃指定的入站 UDP 与 TCP DNS 查询。该模块面向
 大型拒绝列表设计，不需要为每个 zone 建立一条 iptables 规则。
 
-代码同时适配 CentOS 7 的 3.10 内核所使用的旧 Netfilter hook ABI，以及
-Rocky Linux 9 的 5.14 内核所使用的新 ABI；procfs 控制接口也同时兼容 Linux 5.6
+代码同时适配 CentOS 7 的 3.10 内核所使用的 Netfilter hook ABI，以及
+Rocky Linux 9 的 5.14 内核所使用的新 ABI。CentOS 7 的五参数 hook 会按目标
+头文件中的实际函数类型选择，兼容第五个参数为 `okfn` 或回移植的
+`nf_hook_state` 的接口；统计开关按头文件能力选择旧版 `static_key_*` 或
+新版 `static_branch_*` API。procfs 控制接口也同时兼容 Linux 5.6
 之前的 `file_operations` 与 Linux 5.6 起的 `proc_ops`。必须在目标 Linux 主机上，
 或使用目标主机对应的内核头文件编译；不能在 macOS 上构建内核模块。
 
@@ -36,6 +39,16 @@ cd domain_fw
 make
 sudo insmod domain_fw.ko
 ```
+
+默认使用 `/lib/modules/$(uname -r)/build`。若要针对另一个已安装开发包的内核
+编译，可显式指定目录，例如：
+
+```sh
+make KDIR=/usr/src/kernels/3.10.0-1160.119.1.el7.x86_64
+```
+
+只更新 `kernel-devel` 不会切换正在运行的内核。生成的模块应在与该开发包匹配
+的内核上加载；解决 CentOS 7 的上述接口兼容问题不需要升级内核。
 
 模块会创建以下控制文件：
 
